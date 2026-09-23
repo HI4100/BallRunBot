@@ -53,8 +53,10 @@ public class BallRunAccessibilityService extends AccessibilityService {
                     float w = getResources().getDisplayMetrics().widthPixels;
                     float h = getResources().getDisplayMetrics().heightPixels;
 
-                    float cx = p.getFloat("player_x", w / 2f);
-                    float y = p.getFloat("player_y", h * 0.82f);
+                    float playerX = p.getFloat("player_x", w / 2f);
+                    float playerY = p.getFloat("player_y", h * 0.82f);
+                    float cx = playerX;
+                    float y = playerY;
 
                     float delta = p.getFloat("steer_delta", 60f);
                     long duration = p.getLong("steer_duration", 100);
@@ -73,6 +75,9 @@ public class BallRunAccessibilityService extends AccessibilityService {
                     p.edit()
                             .putString("command", "NONE")
                             .putLong("command_until", 0)
+                            .putFloat("last_gesture_player_x", playerX)
+                            .putLong("last_gesture_at", now)
+                            .putBoolean("last_gesture_logical_left", logicalLeft)
                             .apply();
                 }
 
