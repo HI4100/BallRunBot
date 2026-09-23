@@ -1,0 +1,1 @@
+<resources><string name="app_name">Ball Run Bot</string><string name="accessibility_description">Ball Run Bot steering controller. It sends short horizontal gestures only when the bot is explicitly running and vision has a valid steering command.</string></resources>
