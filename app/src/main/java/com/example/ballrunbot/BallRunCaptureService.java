@@ -495,6 +495,31 @@ public class BallRunCaptureService extends Service {
             smoothedBallX = smoothedBallX * 0.65f + ballX * 0.35f;
         }
 
+        // Closed-loop direction calibration: compare the ball's real movement
+        // after the last swipe with the intended movement. This removes the
+        // left/right mapping guess from the controller.
+        long lastGestureAt = prefs.getLong("last_gesture_at", 0);
+        if (lastGestureAt > 0 &&
+                SystemClock.uptimeMillis() - lastGestureAt < 650) {
+            float lastX = prefs.getFloat("last_gesture_player_x", smoothedBallX);
+            float movement = smoothedBallX - lastX;
+            if (Math.abs(movement) > Math.max(10f, w * 0.012f)) {
+                boolean logicalLeft = prefs.getBoolean("last_gesture_logical_left", false);
+                boolean actualLeft = movement < 0;
+                boolean invert = prefs.getBoolean("invert_steering", true);
+                boolean expectedLeft = logicalLeft ^ invert;
+
+                if (actualLeft != expectedLeft) {
+                    invert = !invert;
+                }
+
+                prefs.edit()
+                        .putBoolean("invert_steering", invert)
+                        .putLong("last_gesture_at", 0)
+                        .apply();
+            }
+        }
+
         planSteering(buf, limit, row, pix, w, h, smoothedBallX);
     }
 
