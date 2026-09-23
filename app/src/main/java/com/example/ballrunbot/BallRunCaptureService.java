@@ -372,6 +372,10 @@ public class BallRunCaptureService extends Service {
         }
 
         float ballX = player.cx;
+        prefs.edit()
+                .putFloat("player_x", player.cx)
+                .putFloat("player_y", player.cy)
+                .apply();
         if (smoothedBallX < 0) {
             smoothedBallX = ballX;
         } else {
