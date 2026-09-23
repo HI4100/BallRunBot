@@ -1,0 +1,13 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.example.ballrunbot'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.example.ballrunbot'
+        minSdk 30
+        targetSdk 35
+        versionCode 3
+        versionName '1.1'
+    }
+}
