@@ -158,14 +158,22 @@ public class BallRunCaptureService extends Service {
         int i = y * rowStride + x * pixelStride;
         if (i < 0 || i + 3 >= limit) return false;
 
-        int r = buf.get(i + 2) & 255;
+        // ImageReader RGBA_8888 is R,G,B,A in increasing byte order.
+        int r = buf.get(i) & 255;
         int g = buf.get(i + 1) & 255;
-        int b = buf.get(i) & 255;
+        int b = buf.get(i + 2) & 255;
 
-        return r > 145 && b > 80 &&
-                r > g * 1.35f &&
-                b > g * 1.12f &&
-                (r + b) > 330;
+        int max = Math.max(r, Math.max(g, b));
+        int min = Math.min(r, Math.min(g, b));
+        int spread = max - min;
+
+        // BALL RUN uses vivid pink/purple game elements. Accept both
+        // magenta and purple while rejecting grey/white UI and dark pixels.
+        return max >= 140 &&
+                spread >= 55 &&
+                r >= g + 45 &&
+                b >= g + 25 &&
+                (r + b) >= 300;
     }
 
     private Component findPlayer(ByteBuffer buf, int limit, int rowStride,
