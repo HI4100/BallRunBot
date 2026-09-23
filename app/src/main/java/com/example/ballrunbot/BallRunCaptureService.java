@@ -27,6 +27,7 @@ public class BallRunCaptureService extends Service {
         int area;
         int minX, maxX, minY, maxY;
         float cx, cy;
+        float meanV;
     }
 
     @Override
@@ -258,10 +259,10 @@ public class BallRunCaptureService extends Service {
         return best;
     }
 
-    private Component findNearestObstacle(ByteBuffer buf, int limit, int rowStride,
-                                          int pixelStride, int w, int h, float ballX) {
-        int startY = (int) (h * 0.18f);
-        int endY = (int) (h * 0.70f);
+    private ArrayList<Component> findObstacles(ByteBuffer buf, int limit, int rowStride,
+                                               int pixelStride, int w, int h) {
+        int startY = (int) (h * 0.28f);
+        int endY = (int) (h * 0.72f);
         int gx = (w + STEP - 1) / STEP;
         int rows = (int) Math.ceil((endY - startY) / (float) STEP);
 
@@ -278,8 +279,7 @@ public class BallRunCaptureService extends Service {
 
         boolean[] seen = new boolean[mask.length];
         int[] queue = new int[mask.length];
-        Component best = null;
-        float bestScore = Float.MAX_VALUE;
+        ArrayList<Component> out = new ArrayList<>();
 
         for (int i = 0; i < mask.length; i++) {
             if (!mask[i] || seen[i]) continue;
@@ -289,7 +289,7 @@ public class BallRunCaptureService extends Service {
             seen[i] = true;
 
             int area = 0, minX = gx, maxX = 0, minY = rows, maxY = 0;
-            long sx = 0, sy = 0;
+            long sx = 0, sy = 0, sumV = 0;
 
             while (head < tail) {
                 int p = queue[head++];
@@ -301,6 +301,15 @@ public class BallRunCaptureService extends Service {
                 area++;
                 sx += px;
                 sy += py;
+
+                int bi = py * rowStride + px * pixelStride;
+                if (bi >= 0 && bi + 2 < limit) {
+                    int r = buf.get(bi) & 255;
+                    int g = buf.get(bi + 1) & 255;
+                    int b = buf.get(bi + 2) & 255;
+                    sumV += Math.max(r, Math.max(g, b));
+                }
+
                 if (xg < minX) minX = xg;
                 if (xg > maxX) maxX = xg;
                 if (yg < minY) minY = yg;
@@ -313,37 +322,136 @@ public class BallRunCaptureService extends Service {
                 if (yg + 1 < rows && mask[down] && !seen[down]) { seen[down] = true; queue[tail++] = down; }
             }
 
-            float cx = sx / (float) area;
-            float cy = sy / (float) area;
             int width = (maxX - minX + 1) * STEP;
             int height = (maxY - minY + 1) * STEP;
             float ratio = height == 0 ? 99f : (float) width / height;
+            float cy = sy / (float) area;
+            float meanV = sumV / (float) Math.max(1, area);
 
-            // Ignore tiny text/noise and very thin track lines.
-            if (area < 22 || area > 6000) continue;
-            if (ratio < 0.25f || ratio > 4.0f) continue;
-            if (cy >= h * 0.70f || cy >= h * 0.90f) continue;
-            if (cy >= h * 0.58f && Math.abs(cx - ballX) < w * 0.12f) continue;
+            if (area < 18 || area > 6000) continue;
+            if (cy < h * 0.30f || cy > h * 0.72f) continue;
+            if (ratio < 0.20f || ratio > 5.0f) continue;
 
-            // Prefer the obstacle physically closest to the player.
-            float dy = Math.max(0, h * 0.82f - cy);
-            float dx = Math.abs(cx - ballX);
-            float score = dy * 0.9f + dx * 0.20f;
+            // The game's real blocks are bright, solid purple. The magenta
+            // tunnel/side-wall decoration visible in the supplied gameplay
+            // video is noticeably darker and must not become an obstacle.
+            if (meanV < 225f) continue;
 
-            if (score < bestScore) {
-                bestScore = score;
-                best = new Component();
-                best.area = area;
-                best.minX = minX * STEP;
-                best.maxX = maxX * STEP;
-                best.minY = startY + minY * STEP;
-                best.maxY = startY + maxY * STEP;
-                best.cx = cx;
-                best.cy = cy;
+            Component c = new Component();
+            c.area = area;
+            c.minX = minX * STEP;
+            c.maxX = Math.min(w - 1, (maxX + 1) * STEP - 1);
+            c.minY = startY + minY * STEP;
+            c.maxY = Math.min(h - 1, startY + (maxY + 1) * STEP - 1);
+            c.cx = sx / (float) area;
+            c.cy = cy;
+            c.meanV = meanV;
+            out.add(c);
+        }
+
+        return out;
+    }
+
+    private Component chooseTargetObstacle(ArrayList<Component> obstacles, float ballX, int w, int h) {
+        Component threat = null;
+        float best = Float.MAX_VALUE;
+
+        for (Component o : obstacles) {
+            // Perspective: the ball occupies less horizontal world-space at
+            // the obstacle's depth than it does at the bottom of the screen.
+            float ballRadius = Math.max(24f, (w * 0.09f));
+            float depthScale = 0.55f;
+            float clearance = Math.max(22f, ballRadius * depthScale);
+
+            float left = o.minX - clearance;
+            float right = o.maxX + clearance;
+
+            if (ballX >= left && ballX <= right) {
+                float urgency = Math.max(0, h * 0.78f - o.cy);
+                float centerDistance = Math.abs(o.cx - ballX);
+                float score = urgency + centerDistance * 0.15f;
+                if (score < best) {
+                    best = score;
+                    threat = o;
+                }
             }
         }
 
-        return best;
+        return threat;
+    }
+
+    private void planSteering(ByteBuffer buf, int limit, int rowStride, int pixelStride,
+                              int w, int h, float ballX) {
+        ArrayList<Component> obstacles = findObstacles(buf, limit, rowStride, pixelStride, w, h);
+
+        if (obstacles.isEmpty()) {
+            clearCommand("PLAYER x=" + (int) ballX + " • CLEAR");
+            return;
+        }
+
+        Component threat = chooseTargetObstacle(obstacles, ballX, w, h);
+        if (threat == null) {
+            clearCommand("PLAYER x=" + (int) ballX + " • OBSTACLE(S) CLEAR");
+            return;
+        }
+
+        float ballRadius = Math.max(24f, w * 0.09f);
+        float clearance = Math.max(22f, ballRadius * 0.55f);
+
+        // Build two escape targets around the threatening block.
+        float leftTarget = threat.minX - clearance;
+        float rightTarget = threat.maxX + clearance;
+
+        // If several blocks exist, reject an escape target that is inside
+        // another block's expanded interval. This handles two-block gates.
+        float leftPenalty = 0f;
+        float rightPenalty = 0f;
+        for (Component o : obstacles) {
+            float oc = Math.max(22f, ballRadius * 0.55f);
+            if (leftTarget >= o.minX - oc && leftTarget <= o.maxX + oc) leftPenalty += 100000f;
+            if (rightTarget >= o.minX - oc && rightTarget <= o.maxX + oc) rightPenalty += 100000f;
+        }
+
+        leftTarget = Math.max(w * 0.08f, Math.min(w * 0.92f, leftTarget));
+        rightTarget = Math.max(w * 0.08f, Math.min(w * 0.92f, rightTarget));
+
+        float leftCost = Math.abs(ballX - leftTarget) + leftPenalty;
+        float rightCost = Math.abs(ballX - rightTarget) + rightPenalty;
+
+        float targetX;
+        if (leftCost < rightCost) {
+            targetX = leftTarget;
+        } else {
+            targetX = rightTarget;
+        }
+
+        float error = targetX - ballX;
+        float deadZone = Math.max(w * 0.018f, 18f);
+
+        if (Math.abs(error) < deadZone) {
+            clearCommand("PLAYER x=" + (int) ballX +
+                    " • THREAT x=" + (int) threat.cx + " • HOLD");
+            return;
+        }
+
+        // Small closed-loop nudges. Never make a giant jump toward a lane.
+        float delta = Math.max(w * 0.025f, Math.min(w * 0.085f, Math.abs(error) * 0.30f));
+        long duration = (long) Math.max(60, Math.min(115, 60 + Math.abs(error) * 0.08f));
+        long validFor = Math.max(130, Math.min(220, duration + 70));
+        String cmd = error < 0 ? "LEFT" : "RIGHT";
+
+        prefs.edit()
+                .putString("command", cmd)
+                .putFloat("steer_delta", delta)
+                .putLong("steer_duration", duration)
+                .putFloat("steer_target_x", targetX)
+                .putLong("command_until", SystemClock.uptimeMillis() + validFor)
+                .putString("vision_detail",
+                        "PLAYER x=" + (int) ballX +
+                        " • THREAT x=" + (int) threat.cx +
+                        " • TARGET x=" + (int) targetX +
+                        " • " + cmd)
+                .apply();
     }
 
     private void clearCommand(String detail) {
@@ -387,41 +495,7 @@ public class BallRunCaptureService extends Service {
             smoothedBallX = smoothedBallX * 0.65f + ballX * 0.35f;
         }
 
-        Component obstacle = findNearestObstacle(buf, limit, row, pix, w, h, smoothedBallX);
-
-        if (obstacle == null) {
-            clearCommand("PLAYER x=" + (int) smoothedBallX + " • NO OBSTACLE");
-            return;
-        }
-
-        float error = obstacle.cx - smoothedBallX;
-        float absError = Math.abs(error);
-
-        // Ignore obstacles that are already well away from the player's path.
-        float deadZone = Math.max(w * 0.055f, 42f);
-        if (absError < deadZone) {
-            clearCommand("PLAYER x=" + (int) smoothedBallX +
-                    " • OBSTACLE x=" + (int) obstacle.cx + " • CENTER");
-            return;
-        }
-
-        // Adaptive control: larger error = stronger/faster correction.
-        float delta = Math.max(35f, Math.min(w * 0.18f, absError * 0.38f));
-        long duration = (long) Math.max(75, Math.min(180, 75 + absError * 0.18f));
-        long validFor = Math.max(140, Math.min(280, duration + 90));
-
-        String cmd = error > 0 ? "LEFT" : "RIGHT";
-
-        prefs.edit()
-                .putString("command", cmd)
-                .putFloat("steer_delta", delta)
-                .putLong("steer_duration", duration)
-                .putLong("command_until", SystemClock.uptimeMillis() + validFor)
-                .putString("vision_detail",
-                        "PLAYER x=" + (int) smoothedBallX +
-                        " • OBSTACLE x=" + (int) obstacle.cx +
-                        " • " + cmd + " " + (int) delta + "px/" + duration + "ms")
-                .apply();
+        planSteering(buf, limit, row, pix, w, h, smoothedBallX);
     }
 
     @Override
