@@ -9,7 +9,6 @@ import android.media.projection.MediaProjection;
 import android.os.*;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BallRunCaptureService extends Service {
@@ -17,530 +16,233 @@ public class BallRunCaptureService extends Service {
     private ImageReader reader;
     private VirtualDisplay display;
     private SharedPreferences prefs;
-    private long frames = 0;
-    private long lastProcess = 0;
-    private float smoothedBallX = -1;
+    private long frames, lastProcess;
+    private float ballX = -1f;
     private final AtomicBoolean busy = new AtomicBoolean(false);
+    private static final int STEP = 6;
 
-    private static final int STEP = 8;
-
-    private static final class Component {
-        int area;
-        int minX, maxX, minY, maxY;
-        float cx, cy;
-        float meanV;
+    private static final class C {
+        int area,minX,maxX,minY,maxY;
+        float cx,cy,fill,ratio,meanV;
+    }
+    private static final class Gap {
+        float left,right,center,width;
+        Gap(float l,float r){left=l;right=r;center=(l+r)/2f;width=r-l;}
     }
 
-    @Override
-    public void onCreate() {
+    @Override public void onCreate(){
         super.onCreate();
-        prefs = getSharedPreferences("bot", MODE_PRIVATE);
-        createChannel();
-    }
-
-    private void createChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
+        prefs=getSharedPreferences("bot",MODE_PRIVATE);
+        if(Build.VERSION.SDK_INT>=26)
             getSystemService(NotificationManager.class).createNotificationChannel(
-                    new NotificationChannel("capture", "Ball Run Bot", NotificationManager.IMPORTANCE_LOW));
-        }
+                new NotificationChannel("capture","Ball Run Bot",NotificationManager.IMPORTANCE_LOW));
     }
 
-    private Notification notification(String t) {
-        Notification.Builder b = Build.VERSION.SDK_INT >= 26
-                ? new Notification.Builder(this, "capture")
-                : new Notification.Builder(this);
-        return b.setContentTitle("Ball Run Bot")
-                .setContentText(t)
-                .setSmallIcon(android.R.drawable.ic_media_play)
-                .setOngoing(true)
-                .build();
+    private Notification note(String s){
+        Notification.Builder b=Build.VERSION.SDK_INT>=26
+            ?new Notification.Builder(this,"capture"):new Notification.Builder(this);
+        return b.setContentTitle("Ball Run Bot").setContentText(s)
+            .setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true).build();
     }
 
-    @Override
-    public int onStartCommand(Intent in, int flags, int id) {
-        if (in == null) return START_NOT_STICKY;
-
-        int rc = in.getIntExtra("resultCode", Activity.RESULT_CANCELED);
-        Intent data = in.getParcelableExtra("data");
-
-        if (rc != Activity.RESULT_OK || data == null) {
-            fail("Capture permission missing");
-            return START_NOT_STICKY;
-        }
-
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(10, notification("Screen capture active"),
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-        } else {
-            startForeground(10, notification("Screen capture active"));
-        }
-
-        setupProjection(data, rc);
+    @Override public int onStartCommand(Intent in,int flags,int id){
+        if(in==null)return START_NOT_STICKY;
+        int rc=in.getIntExtra("resultCode",Activity.RESULT_CANCELED);
+        Intent data=in.getParcelableExtra("data");
+        if(rc!=Activity.RESULT_OK||data==null){fail("Capture permission missing");return START_NOT_STICKY;}
+        if(Build.VERSION.SDK_INT>=29)
+            startForeground(10,note("Screen capture active"),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        else startForeground(10,note("Screen capture active"));
+        android.media.projection.MediaProjectionManager m=
+            (android.media.projection.MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
+        projection=m.getMediaProjection(rc,data);
+        if(projection==null){fail("Capture permission failed");return START_NOT_STICKY;}
+        projection.registerCallback(new MediaProjection.Callback(){
+            @Override public void onStop(){fail("Screen capture stopped");}
+        },new Handler(Looper.getMainLooper()));
+        createDisplay();
         return START_NOT_STICKY;
     }
 
-    private void fail(String msg) {
-        prefs.edit().putBoolean("capture_active", false)
-                .putBoolean("bot_running", false)
-                .putString("command", "NONE")
-                .putLong("command_until", 0)
-                .putString("vision_detail", msg)
-                .apply();
+    private void fail(String s){
+        prefs.edit().putBoolean("capture_active",false).putBoolean("bot_running",false)
+            .putString("command","NONE").putLong("command_until",0)
+            .putString("vision_detail",s).apply();
         stopSelf();
     }
 
-    private void setupProjection(Intent data, int rc) {
-        android.media.projection.MediaProjectionManager m =
-                (android.media.projection.MediaProjectionManager)
-                        getSystemService(MEDIA_PROJECTION_SERVICE);
-
-        projection = m.getMediaProjection(rc, data);
-        if (projection == null) {
-            fail("Capture permission failed");
-            return;
-        }
-
-        projection.registerCallback(new MediaProjection.Callback() {
-            @Override
-            public void onStop() {
-                fail("Screen capture stopped");
-            }
-        }, new Handler(Looper.getMainLooper()));
-
-        createDisplay();
+    private void createDisplay(){
+        android.util.DisplayMetrics dm=getResources().getDisplayMetrics();
+        int w=dm.widthPixels,h=dm.heightPixels;
+        reader=ImageReader.newInstance(w,h,PixelFormat.RGBA_8888,2);
+        reader.setOnImageAvailableListener(r->{
+            Image im=null;
+            try{
+                im=r.acquireLatestImage();
+                if(im==null||busy.get())return;
+                busy.set(true);frames++;
+                prefs.edit().putLong("frames",frames).putBoolean("capture_active",true).apply();
+                long now=SystemClock.uptimeMillis();
+                if(now-lastProcess>=100){lastProcess=now;analyze(im);}
+            }catch(Throwable e){clear("VISION ERROR");}
+            finally{if(im!=null)im.close();busy.set(false);}
+        },new Handler(Looper.getMainLooper()));
+        display=projection.createVirtualDisplay("BallRunBot",w,h,dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader.getSurface(),null,null);
     }
 
-    private void createDisplay() {
-        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-        int w = dm.widthPixels;
-        int h = dm.heightPixels;
-
-        reader = ImageReader.newInstance(
-                w, h, PixelFormat.RGBA_8888, 2);
-
-        reader.setOnImageAvailableListener(r -> {
-            Image im = null;
-            try {
-                im = r.acquireLatestImage();
-                if (im == null || busy.get()) return;
-
-                busy.set(true);
-                frames++;
-
-                prefs.edit()
-                        .putLong("frames", frames)
-                        .putBoolean("capture_active", true)
-                        .apply();
-
-                long now = SystemClock.uptimeMillis();
-                if (now - lastProcess >= 120) {
-                    lastProcess = now;
-                    analyze(im);
-                }
-            } catch (Exception e) {
-                prefs.edit()
-                        .putString("command", "NONE")
-                        .putLong("command_until", 0)
-                        .putString("vision_detail", "Vision error")
-                        .apply();
-            } finally {
-                if (im != null) im.close();
-                busy.set(false);
-            }
-        }, new Handler(Looper.getMainLooper()));
-
-        display = projection.createVirtualDisplay(
-                "BallRunBot", w, h, dm.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.getSurface(), null, null);
+    private boolean pink(ByteBuffer b,int lim,int row,int pix,int x,int y){
+        int i=y*row+x*pix;if(i<0||i+3>=lim)return false;
+        int r=b.get(i)&255,g=b.get(i+1)&255,bl=b.get(i+2)&255;
+        int mx=Math.max(r,Math.max(g,bl)),mn=Math.min(r,Math.min(g,bl));
+        return mx>=145&&mx-mn>=60&&r>=g+55&&bl>=g+30&&r+bl>=310;
     }
 
-    private boolean isPink(ByteBuffer buf, int limit, int rowStride, int pixelStride,
-                           int x, int y) {
-        int i = y * rowStride + x * pixelStride;
-        if (i < 0 || i + 3 >= limit) return false;
-
-        // ImageReader RGBA_8888 is R,G,B,A in increasing byte order.
-        int r = buf.get(i) & 255;
-        int g = buf.get(i + 1) & 255;
-        int b = buf.get(i + 2) & 255;
-
-        int max = Math.max(r, Math.max(g, b));
-        int min = Math.min(r, Math.min(g, b));
-        int spread = max - min;
-
-        // BALL RUN uses vivid pink/purple game elements. Accept both
-        // magenta and purple while rejecting grey/white UI and dark pixels.
-        return max >= 140 &&
-                spread >= 55 &&
-                r >= g + 45 &&
-                b >= g + 25 &&
-                (r + b) >= 300;
+    private int score(ByteBuffer b,int lim,int row,int pix,int x,int y){
+        int i=y*row+x*pix;if(i<0||i+2>=lim)return 0;
+        int r=b.get(i)&255,g=b.get(i+1)&255,bl=b.get(i+2)&255;
+        if(r<90||bl<70||r<g+35||bl<g+15)return 0;
+        return Math.max(0,(r-g)+(bl-g));
     }
 
-    private Component findPlayer(ByteBuffer buf, int limit, int rowStride,
-                                 int pixelStride, int w, int h) {
-        int gx = (w + STEP - 1) / STEP;
-        int gy = (int) Math.ceil((h * 0.46f) / STEP);
-        int startY = (int) (h * 0.46f);
-        int rows = (int) Math.ceil((h * 0.96f - startY) / STEP);
-        if (rows <= 0) return null;
-
-        boolean[] mask = new boolean[gx * rows];
-
-        for (int ry = 0; ry < rows; ry++) {
-            int y = startY + ry * STEP;
-            if (y >= h) continue;
-            for (int ix = 0; ix < gx; ix++) {
-                int x = ix * STEP;
-                if (x < w && isPink(buf, limit, rowStride, pixelStride, x, y)) {
-                    mask[ry * gx + ix] = true;
-                }
-            }
+    private float findBall(ByteBuffer b,int lim,int row,int pix,int w,int h){
+        int y0=(int)(h*.57f),y1=(int)(h*.82f);
+        int expected=ballX<0?w/2:Math.round(ballX);
+        int half=ballX<0?w:Math.min(150,Math.round(w*.27f));
+        int lo=Math.max(0,expected-half),hi=Math.min(w-1,expected+half);
+        int best=expected,bestScore=0;
+        for(int x=lo;x<=hi;x+=STEP){
+            int s=0;
+            for(int y=y0;y<=y1;y+=STEP)s+=score(b,lim,row,pix,x,y);
+            if(s>bestScore){bestScore=s;best=x;}
         }
-
-        Component best = null;
-        boolean[] seen = new boolean[mask.length];
-        int[] queue = new int[mask.length];
-
-        for (int i = 0; i < mask.length; i++) {
-            if (!mask[i] || seen[i]) continue;
-
-            int head = 0, tail = 0;
-            queue[tail++] = i;
-            seen[i] = true;
-
-            int area = 0, minX = gx, maxX = 0, minY = rows, maxY = 0;
-            long sx = 0, sy = 0;
-
-            while (head < tail) {
-                int p = queue[head++];
-                int xg = p % gx;
-                int yg = p / gx;
-                int px = xg * STEP;
-                int py = startY + yg * STEP;
-
-                area++;
-                sx += px;
-                sy += py;
-                if (xg < minX) minX = xg;
-                if (xg > maxX) maxX = xg;
-                if (yg < minY) minY = yg;
-                if (yg > maxY) maxY = yg;
-
-                int left = p - 1, right = p + 1, up = p - gx, down = p + gx;
-                if (xg > 0 && mask[left] && !seen[left]) { seen[left] = true; queue[tail++] = left; }
-                if (xg + 1 < gx && mask[right] && !seen[right]) { seen[right] = true; queue[tail++] = right; }
-                if (yg > 0 && mask[up] && !seen[up]) { seen[up] = true; queue[tail++] = up; }
-                if (yg + 1 < rows && mask[down] && !seen[down]) { seen[down] = true; queue[tail++] = down; }
-            }
-
-            int width = (maxX - minX + 1) * STEP;
-            int height = (maxY - minY + 1) * STEP;
-            float ratio = height == 0 ? 99f : (float) width / height;
-            float centerY = sy / (float) area;
-
-            // A player ball should be a compact, roughly round component near the bottom.
-            if (area < 18 || area > 1200) continue;
-            if (centerY < h * 0.56f) continue;
-            if (ratio < 0.45f || ratio > 2.2f) continue;
-
-            if (best == null || centerY > best.cy || area > best.area * 1.35f) {
-                best = new Component();
-                best.area = area;
-                best.minX = minX * STEP;
-                best.maxX = maxX * STEP;
-                best.minY = startY + minY * STEP;
-                best.maxY = startY + maxY * STEP;
-                best.cx = sx / (float) area;
-                best.cy = centerY;
-            }
+        if(bestScore<180)return -1;
+        long total=0,weighted=0;
+        for(int x=Math.max(lo,best-24);x<=Math.min(hi,best+24);x+=3){
+            int s=0;
+            for(int y=y0;y<=y1;y+=STEP)s+=score(b,lim,row,pix,x,y);
+            total+=s;weighted+=(long)s*x;
         }
-
-        return best;
+        return total>0?(float)weighted/total:best;
     }
 
-    private ArrayList<Component> findObstacles(ByteBuffer buf, int limit, int rowStride,
-                                               int pixelStride, int w, int h) {
-        int startY = (int) (h * 0.28f);
-        int endY = (int) (h * 0.72f);
-        int gx = (w + STEP - 1) / STEP;
-        int rows = (int) Math.ceil((endY - startY) / (float) STEP);
-
-        boolean[] mask = new boolean[gx * rows];
-        for (int ry = 0; ry < rows; ry++) {
-            int y = startY + ry * STEP;
-            for (int ix = 0; ix < gx; ix++) {
-                int x = ix * STEP;
-                if (x < w && isPink(buf, limit, rowStride, pixelStride, x, y)) {
-                    mask[ry * gx + ix] = true;
-                }
+    private ArrayList<C> obstacles(ByteBuffer b,int lim,int row,int pix,int w,int h){
+        int sy=(int)(h*.24f),ey=(int)(h*.70f);
+        int gx=(w+STEP-1)/STEP,rows=(int)Math.ceil((ey-sy)/(float)STEP);
+        boolean[] m=new boolean[gx*rows];
+        for(int gy=0;gy<rows;gy++){
+            int y=sy+gy*STEP;
+            for(int xg=0;xg<gx;xg++){
+                int x=xg*STEP;
+                if(x<w&&pink(b,lim,row,pix,x,y))m[gy*gx+xg]=true;
             }
         }
-
-        boolean[] seen = new boolean[mask.length];
-        int[] queue = new int[mask.length];
-        ArrayList<Component> out = new ArrayList<>();
-
-        for (int i = 0; i < mask.length; i++) {
-            if (!mask[i] || seen[i]) continue;
-
-            int head = 0, tail = 0;
-            queue[tail++] = i;
-            seen[i] = true;
-
-            int area = 0, minX = gx, maxX = 0, minY = rows, maxY = 0;
-            long sx = 0, sy = 0, sumV = 0;
-
-            while (head < tail) {
-                int p = queue[head++];
-                int xg = p % gx;
-                int yg = p / gx;
-                int px = xg * STEP;
-                int py = startY + yg * STEP;
-
-                area++;
-                sx += px;
-                sy += py;
-
-                int bi = py * rowStride + px * pixelStride;
-                if (bi >= 0 && bi + 2 < limit) {
-                    int r = buf.get(bi) & 255;
-                    int g = buf.get(bi + 1) & 255;
-                    int b = buf.get(bi + 2) & 255;
-                    sumV += Math.max(r, Math.max(g, b));
+        boolean[] seen=new boolean[m.length];int[] q=new int[m.length];
+        ArrayList<C> out=new ArrayList<>();
+        for(int z=0;z<m.length;z++){
+            if(!m[z]||seen[z])continue;
+            int head=0,tail=0;q[tail++]=z;seen[z]=true;
+            int area=0,minX=gx,maxX=0,minY=rows,maxY=0;long sx=0,syy=0,sv=0;
+            while(head<tail){
+                int p=q[head++],xg=p%gx,yg=p/gx,px=xg*STEP,py=sy+yg*STEP;
+                area++;sx+=px;syy+=py;
+                int bi=py*row+px*pix;
+                if(bi>=0&&bi+2<lim){
+                    int r=b.get(bi)&255,g=b.get(bi+1)&255,bl=b.get(bi+2)&255;
+                    sv+=Math.max(r,Math.max(g,bl));
                 }
-
-                if (xg < minX) minX = xg;
-                if (xg > maxX) maxX = xg;
-                if (yg < minY) minY = yg;
-                if (yg > maxY) maxY = yg;
-
-                int left = p - 1, right = p + 1, up = p - gx, down = p + gx;
-                if (xg > 0 && mask[left] && !seen[left]) { seen[left] = true; queue[tail++] = left; }
-                if (xg + 1 < gx && mask[right] && !seen[right]) { seen[right] = true; queue[tail++] = right; }
-                if (yg > 0 && mask[up] && !seen[up]) { seen[up] = true; queue[tail++] = up; }
-                if (yg + 1 < rows && mask[down] && !seen[down]) { seen[down] = true; queue[tail++] = down; }
+                if(xg<minX)minX=xg;if(xg>maxX)maxX=xg;if(yg<minY)minY=yg;if(yg>maxY)maxY=yg;
+                int a=p-1,c=p+1,u=p-gx,d=p+gx;
+                if(xg>0&&m[a]&&!seen[a]){seen[a]=true;q[tail++]=a;}
+                if(xg+1<gx&&m[c]&&!seen[c]){seen[c]=true;q[tail++]=c;}
+                if(yg>0&&m[u]&&!seen[u]){seen[u]=true;q[tail++]=u;}
+                if(yg+1<rows&&m[d]&&!seen[d]){seen[d]=true;q[tail++]=d;}
             }
-
-            int width = (maxX - minX + 1) * STEP;
-            int height = (maxY - minY + 1) * STEP;
-            float ratio = height == 0 ? 99f : (float) width / height;
-            float cy = sy / (float) area;
-            float meanV = sumV / (float) Math.max(1, area);
-
-            if (area < 18 || area > 6000) continue;
-            if (cy < h * 0.30f || cy > h * 0.72f) continue;
-            if (ratio < 0.20f || ratio > 5.0f) continue;
-
-            // The game's real blocks are bright, solid purple. The magenta
-            // tunnel/side-wall decoration visible in the supplied gameplay
-            // video is noticeably darker and must not become an obstacle.
-            if (meanV < 225f) continue;
-
-            Component c = new Component();
-            c.area = area;
-            c.minX = minX * STEP;
-            c.maxX = Math.min(w - 1, (maxX + 1) * STEP - 1);
-            c.minY = startY + minY * STEP;
-            c.maxY = Math.min(h - 1, startY + (maxY + 1) * STEP - 1);
-            c.cx = sx / (float) area;
-            c.cy = cy;
-            c.meanV = meanV;
-            out.add(c);
+            int ww=(maxX-minX+1)*STEP,hh=(maxY-minY+1)*STEP;
+            float ratio=hh==0?99:(float)ww/hh;
+            float fill=(float)area/Math.max(1,(maxX-minX+1)*(maxY-minY+1));
+            float cy=syy/(float)Math.max(1,area),mv=sv/(float)Math.max(1,area);
+            if(area<25||area>8000||ww<16||hh<16||ww>230||hh>230)continue;
+            if(ratio<.50f||ratio>1.75f||fill<.55f||mv<215||cy<h*.25f||cy>h*.70f)continue;
+            if(cy>h*.52f&&area>5000)continue;
+            C o=new C();o.area=area;o.minX=minX*STEP;o.maxX=Math.min(w-1,(maxX+1)*STEP-1);
+            o.minY=sy+minY*STEP;o.maxY=Math.min(h-1,sy+(maxY+1)*STEP-1);
+            o.cx=sx/(float)area;o.cy=cy;o.fill=fill;o.ratio=ratio;o.meanV=mv;out.add(o);
         }
-
         return out;
     }
 
-    private Component chooseTargetObstacle(ArrayList<Component> obstacles, float ballX, int w, int h) {
-        Component threat = null;
-        float best = Float.MAX_VALUE;
-
-        for (Component o : obstacles) {
-            // Perspective: the ball occupies less horizontal world-space at
-            // the obstacle's depth than it does at the bottom of the screen.
-            float ballRadius = Math.max(24f, (w * 0.09f));
-            float depthScale = 0.55f;
-            float clearance = Math.max(22f, ballRadius * depthScale);
-
-            float left = o.minX - clearance;
-            float right = o.maxX + clearance;
-
-            if (ballX >= left && ballX <= right) {
-                float urgency = Math.max(0, h * 0.78f - o.cy);
-                float centerDistance = Math.abs(o.cx - ballX);
-                float score = urgency + centerDistance * 0.15f;
-                if (score < best) {
-                    best = score;
-                    threat = o;
-                }
-            }
+    private Gap safeGap(ArrayList<C> os,float bx,int w){
+        float L=w*.12f,R=w*.88f;
+        ArrayList<float[]> rs=new ArrayList<>();
+        for(C o:os){
+            float pad=Math.max(10,Math.min(26,Math.min(o.maxX-o.minX,o.maxY-o.minY)*.22f));
+            float a=Math.max(L,o.minX-pad),bb=Math.min(R,o.maxX+pad);
+            if(bb>a)rs.add(new float[]{a,bb});
         }
-
-        return threat;
+        if(rs.isEmpty())return null;
+        rs.sort((a,b)->Float.compare(a[0],b[0]));
+        ArrayList<float[]> merged=new ArrayList<>();
+        for(float[] r:rs){
+            if(merged.isEmpty()||r[0]>merged.get(merged.size()-1)[1]+2)merged.add(new float[]{r[0],r[1]});
+            else{float[] last=merged.get(merged.size()-1);last[1]=Math.max(last[1],r[1]);}
+        }
+        ArrayList<Gap> gaps=new ArrayList<>();float cur=L;
+        for(float[] r:merged){if(r[0]-cur>=15)gaps.add(new Gap(cur,r[0]));cur=Math.max(cur,r[1]);}
+        if(R-cur>=15)gaps.add(new Gap(cur,R));
+        if(gaps.isEmpty())return null;
+        Gap best=null;float bs=Float.MAX_VALUE;
+        for(Gap g:gaps){
+            float s=Math.abs(g.center-bx)+Math.max(0,55-g.width)*3;
+            if(g.width<22)s+=500;
+            if(s<bs){bs=s;best=g;}
+        }
+        return best;
     }
 
-    private void planSteering(ByteBuffer buf, int limit, int rowStride, int pixelStride,
-                              int w, int h, float ballX) {
-        ArrayList<Component> obstacles = findObstacles(buf, limit, rowStride, pixelStride, w, h);
-
-        if (obstacles.isEmpty()) {
-            clearCommand("PLAYER x=" + (int) ballX + " • CLEAR");
-            return;
+    private void plan(ArrayList<C> os,int w,float bx){
+        if(os.isEmpty()){clear("BALL x="+(int)bx+" • CLEAR");return;}
+        Gap g=safeGap(os,bx,w);
+        if(g==null){clear("BALL x="+(int)bx+" • NO SAFE GAP");return;}
+        float err=g.center-bx;
+        if(Math.abs(err)<=Math.max(18,w*.025f)){
+            clear("NEON "+os.size()+" • BALL x="+(int)bx+" • SAFE x="+(int)g.center+" • HOLD");return;
         }
-
-        Component threat = chooseTargetObstacle(obstacles, ballX, w, h);
-        if (threat == null) {
-            clearCommand("PLAYER x=" + (int) ballX + " • OBSTACLE(S) CLEAR");
-            return;
-        }
-
-        float ballRadius = Math.max(24f, w * 0.09f);
-        float clearance = Math.max(22f, ballRadius * 0.55f);
-
-        // Build two escape targets around the threatening block.
-        float leftTarget = threat.minX - clearance;
-        float rightTarget = threat.maxX + clearance;
-
-        // If several blocks exist, reject an escape target that is inside
-        // another block's expanded interval. This handles two-block gates.
-        float leftPenalty = 0f;
-        float rightPenalty = 0f;
-        for (Component o : obstacles) {
-            float oc = Math.max(22f, ballRadius * 0.55f);
-            if (leftTarget >= o.minX - oc && leftTarget <= o.maxX + oc) leftPenalty += 100000f;
-            if (rightTarget >= o.minX - oc && rightTarget <= o.maxX + oc) rightPenalty += 100000f;
-        }
-
-        leftTarget = Math.max(w * 0.08f, Math.min(w * 0.92f, leftTarget));
-        rightTarget = Math.max(w * 0.08f, Math.min(w * 0.92f, rightTarget));
-
-        float leftCost = Math.abs(ballX - leftTarget) + leftPenalty;
-        float rightCost = Math.abs(ballX - rightTarget) + rightPenalty;
-
-        float targetX;
-        if (leftCost < rightCost) {
-            targetX = leftTarget;
-        } else {
-            targetX = rightTarget;
-        }
-
-        float error = targetX - ballX;
-        float deadZone = Math.max(w * 0.018f, 18f);
-
-        if (Math.abs(error) < deadZone) {
-            clearCommand("PLAYER x=" + (int) ballX +
-                    " • THREAT x=" + (int) threat.cx + " • HOLD");
-            return;
-        }
-
-        // Small closed-loop nudges. Never make a giant jump toward a lane.
-        float delta = Math.max(w * 0.025f, Math.min(w * 0.085f, Math.abs(error) * 0.30f));
-        long duration = (long) Math.max(60, Math.min(115, 60 + Math.abs(error) * 0.08f));
-        long validFor = Math.max(130, Math.min(220, duration + 70));
-        String cmd = error < 0 ? "LEFT" : "RIGHT";
-
-        prefs.edit()
-                .putString("command", cmd)
-                .putFloat("steer_delta", delta)
-                .putLong("steer_duration", duration)
-                .putFloat("steer_target_x", targetX)
-                .putLong("command_until", SystemClock.uptimeMillis() + validFor)
-                .putString("vision_detail",
-                        "PLAYER x=" + (int) ballX +
-                        " • THREAT x=" + (int) threat.cx +
-                        " • TARGET x=" + (int) targetX +
-                        " • " + cmd)
-                .apply();
+        float delta=Math.max(32,Math.min(w*.13f,Math.abs(err)*.34f));
+        String cmd=err<0?"LEFT":"RIGHT";
+        prefs.edit().putString("command",cmd).putFloat("steer_delta",delta)
+            .putLong("steer_duration",125).putFloat("steer_target_x",g.center)
+            .putLong("command_until",SystemClock.uptimeMillis()+190)
+            .putString("vision_detail","NEON "+os.size()+" • BALL x="+(int)bx+
+                " • SAFE x="+(int)g.center+" • "+cmd).apply();
     }
 
-    private void clearCommand(String detail) {
-        prefs.edit()
-                .putString("command", "NONE")
-                .putLong("command_until", 0)
-                .putString("vision_detail", detail)
-                .apply();
+    private void clear(String s){
+        prefs.edit().putString("command","NONE").putLong("command_until",0)
+            .putString("vision_detail",s).apply();
     }
 
-    private void analyze(Image image) {
-        Image.Plane p = image.getPlanes()[0];
-        ByteBuffer buf = p.getBuffer();
-        int row = p.getRowStride();
-        int pix = p.getPixelStride();
-        int w = image.getWidth();
-        int h = image.getHeight();
-        int limit = buf.limit();
-
-        Component player = findPlayer(buf, limit, row, pix, w, h);
-
-        if (player == null) {
-            smoothedBallX = -1;
-            clearCommand("NO PLAYER • switch to BALL RUN");
-            return;
+    private void analyze(Image im){
+        Image.Plane p=im.getPlanes()[0];ByteBuffer b=p.getBuffer();
+        int row=p.getRowStride(),pix=p.getPixelStride(),w=im.getWidth(),h=im.getHeight(),lim=b.limit();
+        float detected=findBall(b,lim,row,pix,w,h);
+        if(detected<0){clear("NO BALL • keep bot stopped");return;}
+        if(ballX<0)ballX=detected;
+        else{
+            float jump=Math.abs(detected-ballX);
+            if(jump>w*.22f){clear("BALL TRACK LOST • waiting");return;}
+            ballX=ballX*.62f+detected*.38f;
         }
-
-        float ballX = player.cx;
-        prefs.edit()
-                .putFloat("player_x", player.cx)
-                .putFloat("player_y", player.cy)
-                .apply();
-        if (smoothedBallX < 0) {
-            smoothedBallX = ballX;
-        } else {
-            float jump = Math.abs(ballX - smoothedBallX);
-            if (jump > w * 0.28f) {
-                clearCommand("PLAYER REJECTED • unstable frame");
-                return;
-            }
-            smoothedBallX = smoothedBallX * 0.65f + ballX * 0.35f;
-        }
-
-        // Closed-loop direction calibration: compare the ball's real movement
-        // after the last swipe with the intended movement. This removes the
-        // left/right mapping guess from the controller.
-        long lastGestureAt = prefs.getLong("last_gesture_at", 0);
-        if (lastGestureAt > 0 &&
-                SystemClock.uptimeMillis() - lastGestureAt < 650) {
-            float lastX = prefs.getFloat("last_gesture_player_x", smoothedBallX);
-            float movement = smoothedBallX - lastX;
-            if (Math.abs(movement) > Math.max(10f, w * 0.012f)) {
-                boolean logicalLeft = prefs.getBoolean("last_gesture_logical_left", false);
-                boolean actualLeft = movement < 0;
-                boolean invert = prefs.getBoolean("invert_steering", true);
-                boolean expectedLeft = logicalLeft ^ invert;
-
-                if (actualLeft != expectedLeft) {
-                    invert = !invert;
-                }
-
-                prefs.edit()
-                        .putBoolean("invert_steering", invert)
-                        .putLong("last_gesture_at", 0)
-                        .apply();
-            }
-        }
-
-        planSteering(buf, limit, row, pix, w, h, smoothedBallX);
+        prefs.edit().putFloat("player_x",ballX).putFloat("player_y",h*.70f).apply();
+        plan(obstacles(b,lim,row,pix,w,h),w,ballX);
     }
 
-    @Override
-    public void onDestroy() {
-        prefs.edit()
-                .putBoolean("capture_active", false)
-                .putBoolean("bot_running", false)
-                .putString("command", "NONE")
-                .putLong("command_until", 0)
-                .apply();
-
-        if (display != null) display.release();
-        if (reader != null) reader.close();
-        if (projection != null) projection.stop();
+    @Override public void onDestroy(){
+        prefs.edit().putBoolean("capture_active",false).putBoolean("bot_running",false)
+            .putString("command","NONE").putLong("command_until",0).apply();
+        if(display!=null)display.release();if(reader!=null)reader.close();if(projection!=null)projection.stop();
         super.onDestroy();
     }
-
-    @Override
-    public android.os.IBinder onBind(Intent i) {
-        return null;
-    }
+    @Override public android.os.IBinder onBind(Intent i){return null;}
 }
