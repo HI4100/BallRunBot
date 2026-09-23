@@ -53,17 +53,19 @@ public class BallRunAccessibilityService extends AccessibilityService {
                     float w = getResources().getDisplayMetrics().widthPixels;
                     float h = getResources().getDisplayMetrics().heightPixels;
 
-                    float cx = w / 2f;
-                    float y = h * 0.82f;
+                    float cx = p.getFloat("player_x", w / 2f);
+                    float y = p.getFloat("player_y", h * 0.82f);
 
                     float delta = p.getFloat("steer_delta", 60f);
                     long duration = p.getLong("steer_duration", 100);
 
-                    // Keep every gesture inside conservative limits.
+                    // Start the drag on the detected ball and use the calibrated game direction.\n                    // The game may map a finger drag opposite to the ball movement.\n                    // Default is inverted based on the observed control behavior.\n                    // Keep every gesture inside conservative limits.
                     delta = Math.max(30f, Math.min(w * 0.18f, delta));
                     duration = Math.max(70, Math.min(180, duration));
 
-                    float dx = cmd.equals("LEFT") ? -delta : delta;
+                    boolean invert = p.getBoolean("invert_steering", true);
+                    boolean moveLeft = cmd.equals("LEFT") ^ invert;
+                    float dx = moveLeft ? -delta : delta;
 
                     sendDrag(cx, y, cx + dx, y, duration);
                     lastGesture = now;
