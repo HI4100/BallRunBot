@@ -43,11 +43,11 @@ public class BallRunAccessibilityService extends AccessibilityService {
                 if (!running || !capture ||
                         !(cmd.equals("LEFT") || cmd.equals("RIGHT")) ||
                         now > until) {
-                    handler.postDelayed(this, 70);
+                    handler.postDelayed(this, 45);
                     return;
                 }
 
-                if (!gestureInFlight && now - lastGesture >= 220) {
+                if (!gestureInFlight && now - lastGesture >= 135) {
                     float w = getResources().getDisplayMetrics().widthPixels;
                     float h = getResources().getDisplayMetrics().heightPixels;
                     float playerX = p.getFloat("player_x", w / 2f);
@@ -55,8 +55,8 @@ public class BallRunAccessibilityService extends AccessibilityService {
                     float delta = p.getFloat("steer_delta", 45f);
                     long duration = p.getLong("steer_duration", 125);
 
-                    delta = Math.max(28f, Math.min(w * 0.13f, delta));
-                    duration = Math.max(90, Math.min(145, duration));
+                    delta = Math.max(22f, Math.min(w * 0.12f, delta));
+                    duration = Math.max(65, Math.min(110, duration));
 
                     // BALL RUN uses normal drag semantics:
                     // left swipe = left, right swipe = right.
