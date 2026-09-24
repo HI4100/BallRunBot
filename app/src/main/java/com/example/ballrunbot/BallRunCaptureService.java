@@ -306,6 +306,7 @@ public class BallRunCaptureService extends Service {
             clear("TRACK LOST • STOP STEERING");return;
         }
         float bottomY=h*.76f;
+        float ballY=h*.70f;
         float bl=roadLeft(road,bottomY,bx),br=roadRight(road,bottomY,bx);
         if(br-bl<40){clear("TRACK TOO NARROW • HOLD");return;}
 
