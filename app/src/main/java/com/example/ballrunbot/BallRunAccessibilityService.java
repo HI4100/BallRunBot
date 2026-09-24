@@ -55,8 +55,14 @@ public class BallRunAccessibilityService extends AccessibilityService {
                     if (Float.isNaN(target) || target < 1 || target > w - 1) {
                         if (!gestureInFlight) releaseFinger();
                     } else {
-                        if (fingerX < 0) fingerX = clamp(playerX, 20, w - 20);
-                        fingerY = clamp(playerY, 40, h - 40);
+                        // The continued-stroke API requires the next path to
+                        // start at the exact previous endpoint. Keep the
+                        // control finger on one fixed horizontal screen row;
+                        // only X changes as the ball is steered.
+                        if (fingerX < 0) {
+                            fingerX = clamp(playerX, 20, w - 20);
+                            fingerY = clamp(playerY, 40, h - 40);
+                        }
                         target = clamp(target, 20, w - 20);
                         lastVisionTarget = now;
 
@@ -82,7 +88,7 @@ public class BallRunAccessibilityService extends AccessibilityService {
 
         float dx = target - fingerX;
         float endX = Math.abs(dx) < 2f ? fingerX : target;
-        long d = Math.max(45, Math.min(190, duration));
+        long d = Math.max(45, Math.min(140, duration));
 
         Path path = new Path();
         path.moveTo(fingerX, fingerY);
