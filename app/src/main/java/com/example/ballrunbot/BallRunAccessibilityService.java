@@ -10,7 +10,10 @@ public class BallRunAccessibilityService extends AccessibilityService {
     private static volatile boolean enabled = false;
     private Handler handler;
     private boolean gestureInFlight = false;
-    private long lastGesture = 0;
+    private GestureDescription.StrokeDescription currentStroke;
+    private float fingerX = -1f;
+    private float fingerY = -1f;
+    private long lastVisionTarget = 0;
 
     public static void enableController(boolean on) {
         enabled = on;
@@ -27,109 +30,179 @@ public class BallRunAccessibilityService extends AccessibilityService {
         @Override public void run() {
             if (handler == null) return;
             try {
-                if (!enabled) {
-                    handler.postDelayed(this, 250);
-                    return;
-                }
-
                 android.content.SharedPreferences p =
                         getSharedPreferences("bot", MODE_PRIVATE);
-                boolean running = p.getBoolean("bot_running", false);
+                boolean running = enabled && p.getBoolean("bot_running", false);
                 boolean capture = p.getBoolean("capture_active", false);
                 String cmd = p.getString("command", "NONE");
                 long now = SystemClock.uptimeMillis();
                 long until = p.getLong("command_until", 0);
 
-                if (!running || !capture ||
-                        !(cmd.equals("LEFT") || cmd.equals("RIGHT")) ||
-                        now > until) {
-                    handler.postDelayed(this, 45);
+                if (!running || !capture) {
+                    if (!gestureInFlight) releaseFinger();
+                    handler.postDelayed(this, 60);
                     return;
                 }
 
-                if (!gestureInFlight && now - lastGesture >= 135) {
+                if ("MOVE".equals(cmd) && now <= until) {
                     float w = getResources().getDisplayMetrics().widthPixels;
                     float h = getResources().getDisplayMetrics().heightPixels;
+                    float target = p.getFloat("steer_target_x", Float.NaN);
                     float playerX = p.getFloat("player_x", w / 2f);
-                    float playerY = p.getFloat("player_y", h * 0.70f);
-                    float delta = p.getFloat("steer_delta", 45f);
-                    long duration = p.getLong("steer_duration", 125);
+                    float playerY = p.getFloat("player_y", h * .70f);
+                    long duration = p.getLong("steer_duration", 100);
 
-                    delta = Math.max(22f, Math.min(w * 0.12f, delta));
-                    duration = Math.max(65, Math.min(110, duration));
+                    if (Float.isNaN(target) || target < 1 || target > w - 1) {
+                        if (!gestureInFlight) releaseFinger();
+                    } else {
+                        if (fingerX < 0) fingerX = clamp(playerX, 20, w - 20);
+                        fingerY = clamp(playerY, 40, h - 40);
+                        target = clamp(target, 20, w - 20);
+                        lastVisionTarget = now;
 
-                    // BALL RUN uses normal drag semantics:
-                    // left swipe = left, right swipe = right.
-                    boolean moveLeft = cmd.equals("LEFT");
-                    float startX = Math.max(20f, Math.min(w - 20f, playerX));
-                    float endX = moveLeft
-                            ? Math.max(20f, startX - delta)
-                            : Math.min(w - 20f, startX + delta);
-
-                    if (Math.abs(endX - startX) >= 12f) {
-                        sendDrag(startX, playerY, endX, playerY, duration);
-                        lastGesture = now;
+                        if (!gestureInFlight) {
+                            dispatchNextSegment(target, duration, true);
+                        }
                     }
-
-                    // Every gesture is consumed. The next frame must issue
-                    // the next command, preventing stale/repeated movement.
-                    p.edit().putString("command", "NONE")
-                            .putLong("command_until", 0).apply();
+                } else if (now - lastVisionTarget > 280) {
+                    if (!gestureInFlight) releaseFinger();
                 }
 
-                handler.postDelayed(this, 70);
+                handler.postDelayed(this, 35);
             } catch (Throwable t) {
                 enabled = false;
-                getSharedPreferences("bot", MODE_PRIVATE).edit()
-                        .putBoolean("bot_running", false)
-                        .putString("command", "NONE")
-                        .putLong("command_until", 0).apply();
-                handler.postDelayed(this, 500);
+                forceStopState();
+                handler.postDelayed(loop, 500);
             }
         }
     };
 
-    private void sendDrag(float x1, float y1, float x2, float y2, long duration) {
-        Path path = new Path();
-        path.moveTo(x1, y1);
-        path.lineTo(x2, y2);
+    private void dispatchNextSegment(float target, long duration, boolean keepDown) {
+        if (gestureInFlight) return;
 
-        GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(path, 0, duration);
+        float dx = target - fingerX;
+        float endX = Math.abs(dx) < 2f ? fingerX : target;
+        long d = Math.max(45, Math.min(190, duration));
+
+        Path path = new Path();
+        path.moveTo(fingerX, fingerY);
+        float midX = fingerX + (endX - fingerX) * .55f;
+        path.lineTo(midX, fingerY);
+        path.lineTo(endX, fingerY);
+
+        GestureDescription.StrokeDescription stroke;
+        if (currentStroke == null) {
+            stroke = new GestureDescription.StrokeDescription(path, 0, d, keepDown);
+        } else {
+            stroke = currentStroke.continueStroke(path, 0, d, keepDown);
+        }
+
+        currentStroke = stroke;
         gestureInFlight = true;
+        final float finalX = endX;
 
         boolean ok = dispatchGesture(
                 new GestureDescription.Builder().addStroke(stroke).build(),
                 new GestureResultCallback() {
                     @Override public void onCompleted(GestureDescription g) {
+                        fingerX = finalX;
                         gestureInFlight = false;
+
+                        android.content.SharedPreferences p =
+                                getSharedPreferences("bot", MODE_PRIVATE);
+                        boolean running = enabled &&
+                                p.getBoolean("bot_running", false) &&
+                                p.getBoolean("capture_active", false);
+                        String cmd = p.getString("command", "NONE");
+                        long until = p.getLong("command_until", 0);
+
+                        if (running && "MOVE".equals(cmd) &&
+                                SystemClock.uptimeMillis() <= until) {
+                            float nextTarget = p.getFloat("steer_target_x", fingerX);
+                            long nextDuration = p.getLong("steer_duration", 90);
+                            dispatchNextSegment(nextTarget, nextDuration, true);
+                        } else {
+                            releaseFromCompletedStroke();
+                        }
                     }
+
                     @Override public void onCancelled(GestureDescription g) {
                         gestureInFlight = false;
+                        currentStroke = null;
+                        fingerX = -1f;
                     }
                 }, null);
 
-        if (!ok) gestureInFlight = false;
+        if (!ok) {
+            gestureInFlight = false;
+            currentStroke = null;
+            fingerX = -1f;
+        }
+    }
+
+    private void releaseFromCompletedStroke() {
+        if (currentStroke == null || fingerX < 0 || fingerY < 0) {
+            currentStroke = null;
+            fingerX = -1f;
+            return;
+        }
+        try {
+            Path path = new Path();
+            path.moveTo(fingerX, fingerY);
+            GestureDescription.StrokeDescription release =
+                    currentStroke.continueStroke(path, 0, 20, false);
+            currentStroke = null;
+            gestureInFlight = true;
+
+            dispatchGesture(
+                    new GestureDescription.Builder().addStroke(release).build(),
+                    new GestureResultCallback() {
+                        @Override public void onCompleted(GestureDescription g) {
+                            gestureInFlight = false;
+                            fingerX = -1f;
+                        }
+                        @Override public void onCancelled(GestureDescription g) {
+                            gestureInFlight = false;
+                            fingerX = -1f;
+                        }
+                    }, null);
+        } catch (Throwable ignored) {
+            currentStroke = null;
+            gestureInFlight = false;
+            fingerX = -1f;
+        }
+    }
+
+    private void releaseFinger() {
+        if (gestureInFlight) return;
+        releaseFromCompletedStroke();
+    }
+
+    private void forceStopState() {
+        getSharedPreferences("bot", MODE_PRIVATE).edit()
+                .putBoolean("bot_running", false)
+                .putString("command", "NONE")
+                .putLong("command_until", 0)
+                .putString("vision_detail", "CONTROL ERROR • STOPPED")
+                .apply();
+        if (!gestureInFlight) releaseFromCompletedStroke();
+    }
+
+    private float clamp(float v, float lo, float hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {}
 
     @Override public void onInterrupt() {
         enabled = false;
-        getSharedPreferences("bot", MODE_PRIVATE).edit()
-                .putBoolean("bot_running", false)
-                .putString("command", "NONE")
-                .putLong("command_until", 0).apply();
-        if (handler != null) handler.postDelayed(loop, 250);
+        forceStopState();
     }
 
     @Override public void onDestroy() {
         enabled = false;
         if (handler != null) handler.removeCallbacksAndMessages(null);
-        getSharedPreferences("bot", MODE_PRIVATE).edit()
-                .putBoolean("bot_running", false)
-                .putString("command", "NONE")
-                .putLong("command_until", 0).apply();
+        forceStopState();
         super.onDestroy();
     }
 }
