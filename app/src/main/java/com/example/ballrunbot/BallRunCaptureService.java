@@ -99,7 +99,7 @@ public class BallRunCaptureService extends Service {
                 busy.set(true);frames++;
                 prefs.edit().putLong("frames",frames).putBoolean("capture_active",true).apply();
                 long now=SystemClock.uptimeMillis();
-                if(now-lastProcess>=90){lastProcess=now;analyze(im);}
+                if(now-lastProcess>=65){lastProcess=now;analyze(im);}
             }catch(Throwable e){clear("VISION ERROR");}
             finally{if(im!=null)im.close();busy.set(false);}
         },new Handler(Looper.getMainLooper()));
@@ -117,21 +117,14 @@ public class BallRunCaptureService extends Service {
         return mx>=115&&mx-mn>=65&&r>=g+70&&bl>=g+45;
     }
 
-    // From the supplied gameplay: lethal blocks are a different, brighter
-    // violet/purple hue than the ball. Detect that hue only, then require it
-    // to physically sit inside the detected road corridor.
+    // Treat every saturated magenta/pink object as potentially lethal.
+    // The ball is excluded later by its lower position/large component.
     private boolean obstaclePixel(ByteBuffer b,int lim,int row,int pix,int x,int y){
         int i=y*row+x*pix;if(i<0||i+3>=lim)return false;
         int r=b.get(i)&255,g=b.get(i+1)&255,bl=b.get(i+2)&255;
         int mx=Math.max(r,Math.max(g,bl)),mn=Math.min(r,Math.min(g,bl));
-        if(mx<125||mx-mn<75||bl<r+15||r<g+75)return false;
-        // approximate OpenCV hue 135..150 without floating-point HSV
-        int max=mx,min=mn,d=max-min;
-        int hue;
-        if(max==r) hue=(60*(g-bl)/d+360)%360;
-        else if(max==g) hue=60*(bl-r)/d+120;
-        else hue=60*(r-g)/d+240;
-        return hue>=135&&hue<=152;
+        if(mx<105||mx-mn<55||mx-g<55)return false;
+        return r>=g+45 && bl>=g+35;
     }
 
     private ArrayList<C> components(ByteBuffer b,int lim,int row,int pix,
@@ -281,16 +274,19 @@ public class BallRunCaptureService extends Service {
 
     private ArrayList<C> findObstacles(ByteBuffer b,int lim,int row,int pix,int w,int h,
                                        ArrayList<RoadPoint> road){
-        ArrayList<C> raw=components(b,lim,row,pix,w,(int)(h*.28f),(int)(h*.72f),true);
+        ArrayList<C> raw=components(b,lim,row,pix,w,(int)(h*.18f),(int)(h*.76f),true);
         ArrayList<C> out=new ArrayList<>();
+        float ballY=h*.70f;
         for(C o:raw){
             int ww=o.maxX-o.minX+1,hh=o.maxY-o.minY+1;
             float ratio=(float)ww/Math.max(1,hh);
             float left=roadLeft(road,o.cy,o.cx),right=roadRight(road,o.cy,o.cx);
             float overlap=Math.max(0,Math.min(right,o.maxX)-Math.max(left,o.minX));
-            if(o.area<30||o.area>12000||ww<10||hh<8||ww>260||hh>260)continue;
-            if(ratio<.25f||ratio>4.0f)continue;
-            if(right-left<35||overlap<Math.max(8,ww*.35f))continue;
+            boolean ballLike = o.cy>ballY-.08f*h && o.area>500;
+            if(ballLike) continue;
+            if(o.area<18||o.area>30000||ww<5||hh<5||ww>360||hh>300)continue;
+            if(ratio<.12f||ratio>7.0f)continue;
+            if(right-left<25||overlap<Math.max(5,ww*.18f))continue;
             out.add(o);
         }
         return out;
@@ -321,15 +317,18 @@ public class BallRunCaptureService extends Service {
         if(!obs.isEmpty()){
             // Consider the nearest obstacle in travel direction, but account
             // for ALL blocks at nearly the same depth as a gate.
-            float nearest=Float.MAX_VALUE;
-            for(C o:obs)if(o.cy<nearest&&o.cy>h*.36f)nearest=o.cy;
+            float nearest=-1f;
+            // Screen y increases toward the player: the largest y still
+            // ahead of the ball is the NEXT obstacle.
+            for(C o:obs)if(o.cy<ballY+h*.02f && o.cy>nearest)nearest=o.cy;
             ArrayList<C> gate=new ArrayList<>();
-            for(C o:obs)if(Math.abs(o.cy-nearest)<Math.max(45,h*.045f))gate.add(o);
+            if(nearest>=0) for(C o:obs)
+                if(Math.abs(o.cy-nearest)<Math.max(55,h*.055f))gate.add(o);
 
             float gl=roadLeft(road,nearest,bx),gr=roadRight(road,nearest,bx);
             ArrayList<float[]> blocked=new ArrayList<>();
             for(C o:gate){
-                float pad=Math.max(10,Math.min(26,(o.maxY-o.minY+o.maxX-o.minX)*.08f));
+                float pad=Math.max(18,Math.min(48,(o.maxY-o.minY+o.maxX-o.minX)*.13f));
                 blocked.add(new float[]{Math.max(gl,o.minX-pad),Math.min(gr,o.maxX+pad)});
             }
             blocked.sort(Comparator.comparingDouble(a->a[0]));
@@ -345,18 +344,18 @@ public class BallRunCaptureService extends Service {
             ArrayList<Gap> gaps=new ArrayList<>();
             float cur=gl;
             for(float[] q:merged){
-                if(q[0]-cur>=18)gaps.add(new Gap(cur,q[0]));
+                if(q[0]-cur>=28)gaps.add(new Gap(cur,q[0]));
                 cur=Math.max(cur,q[1]);
             }
-            if(gr-cur>=18)gaps.add(new Gap(cur,gr));
+            if(gr-cur>=28)gaps.add(new Gap(cur,gr));
 
             Gap best=null;float score=Float.MAX_VALUE;
             for(Gap g:gaps){
-                if(g.width()<22)continue;
+                if(g.width()<30)continue;
                 float tx=mapAtBottom(road,nearest,g.center(),bottomY);
                 float s=Math.abs(tx-bx);
                 // Prefer wide corridors, but never trade away track safety.
-                s+=Math.max(0,50-g.width())*1.8f;
+                s+=Math.max(0,65-g.width())*2.4f;
                 if(s<score){score=s;best=g;}
             }
             if(best!=null){
@@ -370,20 +369,20 @@ public class BallRunCaptureService extends Service {
         }
 
         float err=target-bx;
-        float edgeMargin=Math.max(24,w*.055f);
+        float edgeMargin=Math.max(30,w*.075f);
         if(bx<bl+edgeMargin){target=Math.max(target,bl+edgeMargin);}
         if(bx>br-edgeMargin){target=Math.min(target,br-edgeMargin);}
         err=target-bx;
 
-        float dead=Math.max(10,w*.018f);
+        float dead=Math.max(7,w*.012f);
         if(Math.abs(err)<=dead){
             clear(detail+" • HOLD");return;
         }
 
         // Small closed-loop drags. The old controller used up to ~13% of the
         // screen width per swipe; that is far too aggressive for this game.
-        float delta=Math.max(w*.025f,Math.min(w*.065f,Math.abs(err)*.20f));
-        long duration=85;
+        float delta=Math.max(w*.030f,Math.min(w*.095f,Math.abs(err)*.30f));
+        long duration=72;
         String cmd=err<0?"LEFT":"RIGHT";
         prefs.edit().putString("command",cmd)
             .putFloat("steer_delta",delta).putLong("steer_duration",duration)
