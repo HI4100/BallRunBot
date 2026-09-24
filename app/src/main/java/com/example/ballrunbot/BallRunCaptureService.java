@@ -377,19 +377,28 @@ public class BallRunCaptureService extends Service {
 
         float dead=Math.max(7,w*.012f);
         if(Math.abs(err)<=dead){
-            clear(detail+" • HOLD");return;
+            prefs.edit().putString("command","MOVE")
+                .putFloat("steer_target_x",bx)
+                .putFloat("steer_delta",0)
+                .putLong("steer_duration",90)
+                .putLong("command_until",SystemClock.uptimeMillis()+230)
+                .putString("vision_detail",detail+" • HOLD").apply();
+            return;
         }
 
-        // Small closed-loop drags. The old controller used up to ~13% of the
-        // screen width per swipe; that is far too aggressive for this game.
-        float delta=Math.max(w*.030f,Math.min(w*.095f,Math.abs(err)*.30f));
-        long duration=72;
-        String cmd=err<0?"LEFT":"RIGHT";
-        prefs.edit().putString("command",cmd)
-            .putFloat("steer_delta",delta).putLong("steer_duration",duration)
-            .putFloat("steer_target_x",target)
-            .putLong("command_until",SystemClock.uptimeMillis()+155)
-            .putString("vision_detail",detail+" • "+cmd+" "+(int)target).apply();
+        // Absolute finger-position control. The game responds to where the
+        // finger is dragged, so publish a target X rather than LEFT/RIGHT taps.
+        float boundedTarget=Math.max(edgeMargin,Math.min(w-edgeMargin,target));
+        float move=Math.abs(boundedTarget-bx);
+        if(move<dead) boundedTarget=bx;
+        long duration=(long)Math.max(55,Math.min(190,45+move*.18f));
+        prefs.edit().putString("command","MOVE")
+            .putFloat("steer_target_x",boundedTarget)
+            .putFloat("steer_delta",boundedTarget-bx)
+            .putLong("steer_duration",duration)
+            .putLong("command_until",SystemClock.uptimeMillis()+230)
+            .putString("vision_detail",detail+" • TARGET "+(int)boundedTarget+
+                    " • "+(boundedTarget<bx?"LEFT":boundedTarget>bx?"RIGHT":"HOLD")).apply();
     }
 
     private void clear(String s){
